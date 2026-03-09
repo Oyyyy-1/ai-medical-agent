@@ -1,5 +1,33 @@
-streamlit==1.40.2
-agno>=2.2.10
-Pillow==10.0.0
-duckduckgo-search==6.4.1
-google-generativeai==0.8.3
+# Web 界面框架
+streamlit>=1.32.0
+
+# 图像处理
+Pillow>=10.0.0
+
+# HTTP 请求（调用 Ollama REST API 和云端 API）
+requests>=2.31.0
+
+# 环境变量管理（读取 .env 文件，保护 API Key）
+python-dotenv>=1.0.0
+
+# Ollama Python 客户端（本地模型，可选）
+ollama>=0.1.9
+
+# LangChain 相关（RAG 知识库）
+langchain>=0.2.0
+langchain-community>=0.2.0
+
+# 向量数据库（本地，免费，无需 API Key）
+chromadb>=0.5.0
+
+# HuggingFace 嵌入模型（本地运行，无需 API Key，约 80MB）
+sentence-transformers>=3.0.0
+
+# PDF 报告生成
+reportlab>=4.0.0
+
+# PubMed 文献抓取（运行 build_knowledge_base.py 时需要）
+biopython>=1.83
+
+# 数据处理
+numpy>=1.24.0

@@ -114,10 +114,9 @@ class MedicalReport(BaseModel):
 # 3. RAG 知识库工具函数
 # ============================================================
 
-# 内置的医学放射学知识片段（作为演示用途）
-# 实际项目中可替换为从 PubMed 下载的真实文献摘要
-# 获取方式：pip install biopython，然后用 Entrez API 下载
-MEDICAL_KNOWLEDGE_BASE = [
+# 内置知识片段（保底 fallback，当 medical_knowledge_base.json 不存在时使用）
+# 运行 build_knowledge_base.py 后会生成 JSON，自动替换为 PubMed 真实文献
+_BUILTIN_KNOWLEDGE = [
     "Chest X-ray is the most common imaging study used in emergency medicine. Normal chest X-ray shows clear lung fields, normal cardiac silhouette (less than 50% of thoracic diameter), and sharp costophrenic angles.",
     "Pneumonia on chest X-ray appears as consolidation or infiltrates in the lung parenchyma. Common findings include air space opacity, air bronchograms, and lobar or segmental involvement.",
     "Pleural effusion on chest X-ray presents as blunting of the costophrenic angle, homogeneous opacity in the lower lung fields, and mediastinal shift away from the effusion in large cases.",
@@ -135,44 +134,72 @@ MEDICAL_KNOWLEDGE_BASE = [
     "PET scan uses radioactive glucose (FDG) to detect metabolically active tissue. Cancer cells show increased FDG uptake. Used for staging and treatment response evaluation.",
 ]
 
+def load_knowledge_base() -> tuple[list[str], str]:
+    """
+    加载医学知识库文本，优先使用 PubMed 文献 JSON，回退到内置知识。
+
+    返回：(知识文本列表, 来源描述字符串)
+
+    优先级：
+      1. medical_knowledge_base.json（由 build_knowledge_base.py 生成）
+      2. 内置 15 条知识片段（保底）
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "medical_knowledge_base.json")
+
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                texts = json.load(f)
+            if isinstance(texts, list) and len(texts) > 0:
+                return texts, f"PubMed文献库（{len(texts)}条）"
+        except Exception:
+            pass   # JSON 损坏时回退
+
+    return _BUILTIN_KNOWLEDGE, f"内置知识库（{len(_BUILTIN_KNOWLEDGE)}条）"
+
+
+# 加载知识库（模块级，只执行一次）
+MEDICAL_KNOWLEDGE_BASE, KB_SOURCE = load_knowledge_base()
+
+
 @st.cache_resource
-# @st.cache_resource 的作用：Streamlit 会缓存这个函数的返回值
-# 这意味着向量数据库只会构建一次，重复刷新页面不会重复构建，节省时间
 def build_rag_knowledge_base():
     """
     构建本地 RAG 向量知识库。
 
     流程：
-      1. 用 sentence-transformers 把文本转换为向量（嵌入）
-      2. 存入 ChromaDB 本地向量数据库
-      3. 查询时把问题也转为向量，找最相似的文本片段
+      1. 加载知识文本（PubMed JSON 或内置知识）
+      2. sentence-transformers 把每条文本转成 384 维向量
+      3. 存入 ChromaDB 本地向量库
+      4. 查询时把诊断词也转为向量，找余弦相似度最高的片段
 
     嵌入模型：all-MiniLM-L6-v2
-      - 完全免费，下载后本地运行
-      - 约 80MB，首次运行会自动下载
+      - 完全免费，首次运行自动下载（约80MB），之后离线使用
+      - 缓存位置：C:/Users/用户名/.cache/huggingface/
     """
     if not RAG_AVAILABLE:
-        return None
+        return None, "RAG库未安装"
 
     try:
-        # HuggingFaceEmbeddings 会自动从 HuggingFace 下载嵌入模型到本地缓存
-        # 之后离线也能用，不需要 API Key
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"}   # 用 CPU 运行，无需 GPU
+            model_kwargs={"device": "cpu"}
         )
 
-        # 创建 ChromaDB 内存向量库（不持久化，每次启动重建，适合演示）
-        # 如果想持久化，改为：Chroma(persist_directory="./medical_kb", ...)
+        # 持久化到本地目录，重启后无需重新向量化，大幅提升启动速度
+        persist_dir = os.path.join(os.path.dirname(__file__), "medical_kb_store")
+
         vectorstore = Chroma.from_texts(
             texts=MEDICAL_KNOWLEDGE_BASE,
             embedding=embeddings,
-            collection_name="medical_knowledge"
+            collection_name="medical_knowledge",
+            persist_directory=persist_dir
         )
-        return vectorstore
+        return vectorstore, KB_SOURCE
+
     except Exception as e:
         st.warning(f"RAG 知识库初始化失败（不影响主功能）: {e}")
-        return None
+        return None, "初始化失败"
 
 
 def search_medical_knowledge(vectorstore, query: str, k: int = 3) -> list[str]:
@@ -412,22 +439,24 @@ def analyze_with_cloud(image_bytes: bytes, api_key: str,
     import re
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    analysis_prompt = """你是一位资深放射科医生，请分析这张医学影像图像。
-请严格按照以下JSON格式回复，不要包含任何markdown标记、代码块或其他文字，只输出纯JSON。
-所有字段的值必须使用中文填写（severity和confidence_level除外，保持英文）。
+    analysis_prompt = """你是一位资深放射科医生，请用中文分析这张医学影像图像。
+重要要求：
+1. 只输出纯JSON，不要有任何多余文字、markdown标记或代码块
+2. 除 severity 和 confidence_level 两个字段保持英文外，所有其他字段的值必须用中文填写
+3. 字符串值不能包含双引号，用中文顿号或逗号代替
 
 {
-  "image_type": "影像类型（如X光/MRI/CT/超声）",
-  "anatomical_region": "检查部位和体位描述",
-  "image_quality": "图像质量评估描述",
-  "key_findings": ["主要发现1", "主要发现2", "主要发现3"],
-  "abnormalities": ["异常发现描述，如无异常填写：未见明显异常"],
-  "primary_diagnosis": "主要诊断结论",
-  "differential_diagnoses": ["鉴别诊断1", "鉴别诊断2"],
+  "image_type": "影像类型（如：胸部X光/头部MRI/腹部CT/腹部超声）",
+  "anatomical_region": "检查部位和体位（如：胸部正侧位）",
+  "image_quality": "图像质量评估（如：图像质量良好，对比度适当）",
+  "key_findings": ["发现1（中文）", "发现2（中文）", "发现3（中文）"],
+  "abnormalities": ["异常描述（中文），如无异常填：未见明显异常"],
+  "primary_diagnosis": "主要诊断结论（中文）",
+  "differential_diagnoses": ["鉴别诊断1（中文）", "鉴别诊断2（中文）"],
   "severity": "Normal or Mild or Moderate or Severe",
   "confidence_level": "Low or Medium or High",
-  "patient_explanation": "用患者能理解的通俗中文解释检查结果，说明是否正常及需要注意的事项",
-  "recommendations": ["临床建议1", "临床建议2"]
+  "patient_explanation": "用患者能理解的通俗中文解释：检查是否正常、发现了什么、需要注意什么",
+  "recommendations": ["建议1（中文）", "建议2（中文）"]
 }"""
 
     payload = {
@@ -518,6 +547,302 @@ def analyze_with_cloud(image_bytes: bytes, api_key: str,
             "recommendations": ["检查 API Key 和 Base URL", "确认账户有余额"],
             "analysis_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
+
+
+# ============================================================
+# 5.5  Tool Use / Function Calling 模块
+# ============================================================
+#
+# 核心概念：
+#   普通 LLM 调用：用户输入 → 模型直接输出
+#   Tool Use：     用户输入 → 模型决定调用哪些工具 → 拿到工具结果 → 模型综合输出
+#
+# 实现方式（OpenAI Function Calling 标准格式）：
+#   1. 定义工具的 JSON Schema，告诉模型"你有哪些工具、每个工具的参数是什么"
+#   2. 第一次请求：把工具定义和用户问题一起发给模型
+#   3. 模型返回 tool_calls（而不是直接回答），说明它想调用哪个工具、传什么参数
+#   4. 我们在本地执行工具，拿到结果
+#   5. 把工具结果塞回对话历史，发起第二次请求
+#   6. 模型拿到工具结果后，生成最终回答
+#
+# 阿里百炼 qwen-vl-max 完全支持 OpenAI 格式的 Function Calling。
+# ============================================================
+
+# ── 工具1定义：本地 RAG 知识库检索 ──────────────────────────
+TOOL_RAG_SEARCH = {
+    "type": "function",
+    "function": {
+        "name": "search_rag_knowledge",
+        "description": (
+            "从本地医学影像 RAG 知识库中检索与诊断相关的参考知识。"
+            "当需要查找某种疾病的影像学特征、诊断标准或鉴别要点时调用此工具。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词，通常是疾病名称或影像学发现，如'肺炎 胸片'或'pneumonia chest X-ray'"
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "返回最相关的前k条结果，默认3，最大5",
+                    "default": 3
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+# ── 工具2定义：DuckDuckGo 网络搜索医学指南 ───────────────────
+TOOL_WEB_SEARCH = {
+    "type": "function",
+    "function": {
+        "name": "search_medical_guidelines",
+        "description": (
+            "在网络上搜索最新的医学指南、临床建议或相关研究。"
+            "当需要了解某种疾病的最新治疗建议、随访方案或循证医学证据时调用此工具。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索词，如'肺结节随访指南 Fleischner'或'chest X-ray pneumonia treatment guidelines'"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+
+def execute_tool(tool_name: str, tool_args: dict, vectorstore) -> str:
+    """
+    在本地执行模型请求的工具调用，返回工具结果字符串。
+
+    这是 Tool Use 循环的关键函数：
+    模型说"我要调用 search_rag_knowledge(query='肺炎')"
+    我们在这里真正执行这个函数，把结果返回给模型。
+
+    参数：
+      tool_name : 工具名称，对应 TOOL_RAG_SEARCH 或 TOOL_WEB_SEARCH 里的 name
+      tool_args : 模型传入的参数字典
+      vectorstore: ChromaDB 向量库实例（RAG工具需要）
+    返回：
+      工具执行结果的字符串
+    """
+    if tool_name == "search_rag_knowledge":
+        # ── 执行本地 RAG 检索 ──
+        query = tool_args.get("query", "")
+        top_k = min(tool_args.get("top_k", 3), 5)   # 最大5，防止模型传太大的值
+
+        if vectorstore is None or not RAG_AVAILABLE:
+            return "RAG知识库暂不可用"
+
+        results = search_medical_knowledge(vectorstore, query, k=top_k)
+        if not results:
+            return f"未找到与'{query}'相关的知识"
+
+        # 拼接成可读的文本块，模型能理解
+        formatted = "\n\n".join([f"[参考{i+1}] {r}" for i, r in enumerate(results)])
+        return f"RAG知识库检索结果（共{len(results)}条）：\n\n{formatted}"
+
+    elif tool_name == "search_medical_guidelines":
+        # ── 执行 DuckDuckGo 网络搜索 ──
+        query = tool_args.get("query", "")
+        try:
+            # 用 requests 调用 DuckDuckGo 的非官方 API（无需 Key）
+            # DuckDuckGo 提供 /html/ 接口，返回搜索摘要
+            search_url = "https://api.duckduckgo.com/"
+            params = {
+                "q": query,
+                "format": "json",
+                "no_html": "1",
+                "skip_disambig": "1"
+            }
+            resp = requests.get(search_url, params=params, timeout=10)
+            data = resp.json()
+
+            results = []
+
+            # AbstractText：搜索结果的摘要段落
+            if data.get("AbstractText"):
+                results.append(f"摘要：{data['AbstractText']}")
+
+            # RelatedTopics：相关主题列表
+            for topic in data.get("RelatedTopics", [])[:3]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    results.append(topic["Text"])
+
+            if results:
+                return "网络搜索结果：\n\n" + "\n\n".join(results)
+            else:
+                return f"未找到'{query}'的相关网络结果（DuckDuckGo即时答案为空，建议换关键词）"
+
+        except Exception as e:
+            return f"网络搜索失败：{str(e)}"
+
+    else:
+        return f"未知工具：{tool_name}"
+
+
+def analyze_with_tool_use(
+    diagnosis: str,
+    image_type: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    vectorstore,
+    max_rounds: int = 3
+) -> dict:
+    """
+    Tool Use Agent 主循环：让模型自主决定调用哪些工具来补充诊断信息。
+
+    这个函数在主分析（analyze_with_cloud）完成后调用，
+    把诊断结果交给模型，让它决定是否需要查知识库或搜网络。
+
+    Tool Use 循环流程：
+      Round 1: 把诊断+工具定义发给模型
+              → 模型返回 tool_calls（想调用哪个工具）
+      Round 2: 执行工具，把结果加入对话历史，再次请求模型
+              → 模型可能再次调用工具，或者直接给出最终总结
+      Round N: 直到模型不再调用工具（finish_reason == "stop"）
+
+    参数：
+      diagnosis   : 主要诊断（从影像分析结果中提取）
+      image_type  : 影像类型（如 X-ray、MRI）
+      api_key     : 云端 API Key
+      base_url    : API Base URL
+      model       : 模型名称（需支持 Function Calling）
+      vectorstore : RAG 向量库
+      max_rounds  : 最大循环轮数，防止无限循环
+    返回：
+      {
+        "summary": "模型综合所有工具结果后的最终建议",
+        "tools_called": ["search_rag_knowledge", ...],  # 实际调用了哪些工具
+        "rag_results": [...],   # RAG工具返回的内容
+        "web_results": [...],   # 网络搜索返回的内容
+        "rounds": 2             # 实际循环了几轮
+      }
+    """
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+
+    # ── 初始对话历史 ──
+    # 告诉模型它的角色和当前诊断，让它决定如何深入检索
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是一位资深放射科医生的AI助手，擅长医学影像诊断。"
+                "根据提供的影像诊断结论，主动使用可用工具检索相关临床知识和最新医学指南，"
+                "为诊断提供循证医学支持。请用中文回答。"
+            )
+        },
+        {
+            "role": "user",
+            "content": (
+                f"影像类型：{image_type}\n"
+                f"主要诊断：{diagnosis}\n\n"
+                "请根据此诊断，使用可用工具检索相关医学知识和临床指南，"
+                "然后给出一个综合性的临床建议总结（2-4句话）。"
+            )
+        }
+    ]
+
+    tools_called = []
+    rag_results = []
+    web_results = []
+    final_summary = ""
+
+    for round_num in range(max_rounds):
+        try:
+            resp = requests.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "tools": [TOOL_RAG_SEARCH, TOOL_WEB_SEARCH],  # 把工具定义传给模型
+                    "tool_choice": "auto",   # auto = 模型自己决定是否调用工具
+                    "max_tokens": 1024,
+                    "temperature": 0.1
+                },
+                timeout=60
+            )
+
+            if resp.status_code != 200:
+                final_summary = f"Tool Use API 请求失败（HTTP {resp.status_code}）"
+                break
+
+            response_data = resp.json()
+            choice = response_data["choices"][0]
+            finish_reason = choice.get("finish_reason", "stop")
+            message = choice["message"]
+
+            # ── 把模型回复加入对话历史（Tool Use 循环必须维护完整历史）──
+            messages.append(message)
+
+            if finish_reason == "tool_calls" or message.get("tool_calls"):
+                # 模型请求调用工具
+                for tc in message.get("tool_calls", []):
+                    tool_name = tc["function"]["name"]
+                    tool_args = json.loads(tc["function"]["arguments"])
+                    tool_call_id = tc["id"]
+
+                    tools_called.append(tool_name)
+
+                    # 本地执行工具
+                    tool_result = execute_tool(tool_name, tool_args, vectorstore)
+
+                    # 收集结果用于前端展示
+                    if tool_name == "search_rag_knowledge":
+                        rag_results.append(tool_result)
+                    elif tool_name == "search_medical_guidelines":
+                        web_results.append(tool_result)
+
+                    # 把工具结果以 tool role 加入对话历史
+                    # 这是 OpenAI Function Calling 协议要求的格式
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,   # 必须和请求里的 id 对应
+                        "content": tool_result
+                    })
+
+            else:
+                # finish_reason == "stop"，模型不再调用工具，给出了最终回答
+                final_summary = message.get("content", "")
+                break
+
+        except Exception as e:
+            final_summary = f"Tool Use 执行出错：{str(e)}"
+            break
+
+    # 如果循环结束还没有最终回答（达到 max_rounds），做最后一次无工具请求
+    if not final_summary:
+        try:
+            resp = requests.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": messages, "max_tokens": 512, "temperature": 0.1},
+                timeout=30
+            )
+            if resp.status_code == 200:
+                final_summary = resp.json()["choices"][0]["message"].get("content", "")
+        except Exception:
+            final_summary = "Tool Use 循环达到最大轮数，未能生成最终总结"
+
+    return {
+        "summary": final_summary,
+        "tools_called": list(set(tools_called)),   # 去重
+        "rag_results": rag_results,
+        "web_results": web_results,
+        "rounds": round_num + 1
+    }
 
 
 # ============================================================
@@ -647,7 +972,7 @@ def generate_pdf_report(report: dict, rag_context: list[str]) -> bytes:
 # 7. Streamlit UI 主界面
 # ============================================================
 
-def render_report_ui(report: dict, rag_context: list[str]):
+def render_report_ui(report: dict, rag_context: list[str], tool_use_result: dict = None):
     """
     渲染结构化诊断报告界面。
     - 全面中文化
@@ -756,6 +1081,38 @@ def render_report_ui(report: dict, rag_context: list[str]):
         with st.expander("展开查看 AI 检索到的医学文献"):
             st.markdown(report["literature_context"])
 
+    # ── Tool Use Agent 结果 ──
+    if tool_use_result and tool_use_result.get("summary"):
+        st.markdown("#### 🔧 Tool Use Agent 综合建议")
+        tools_called = tool_use_result.get("tools_called", [])
+        rounds = tool_use_result.get("rounds", 0)
+
+        # 显示调用了哪些工具（徽章式展示）
+        tool_labels = {
+            "search_rag_knowledge": "🗄️ RAG知识库",
+            "search_medical_guidelines": "🌐 网络搜索"
+        }
+        if tools_called:
+            badges = " &nbsp; ".join(
+                f"<span style='background:#1a3a5c;border:1px solid #4a9eff;"
+                f"padding:2px 10px;border-radius:12px;font-size:0.82em;'>"
+                f"{tool_labels.get(t, t)}</span>"
+                for t in tools_called
+            )
+            st.markdown(
+                f"<div style='margin-bottom:8px;'>已调用工具：{badges}"
+                f"&nbsp;&nbsp;<span style='color:#888;font-size:0.8em;'>（{rounds}轮对话）</span></div>",
+                unsafe_allow_html=True
+            )
+
+        # Tool Use 最终综合建议
+        st.markdown(
+            f"<div style='background:#1a2f1a;border-left:4px solid #66bb6a;"
+            f"padding:12px 16px;border-radius:4px;line-height:1.8;'>"
+            f"{tool_use_result['summary']}</div>",
+            unsafe_allow_html=True
+        )
+
     # ── RAG 知识库参考 ──
     if rag_context:
         st.markdown("#### 🗄️ RAG 知识库参考")
@@ -820,12 +1177,16 @@ def main():
         st.session_state.current_report = None
     if "current_rag_context" not in st.session_state:
         st.session_state.current_rag_context = []
+    if "current_tool_use" not in st.session_state:
+        st.session_state.current_tool_use = None
 
-    # ---- 初始化 RAG 知识库（首次加载，之后缓存） ----
+    # ---- 初始化 RAG 知识库（首次加载，之后缓存）----
+    # build_rag_knowledge_base 返回 (vectorstore, source_description) 元组
     vectorstore = None
+    rag_source_desc = "未初始化"
     if RAG_AVAILABLE:
         with st.spinner("🗄️ 初始化 RAG 知识库（首次启动需下载嵌入模型，约 80MB）..."):
-            vectorstore = build_rag_knowledge_base()
+            vectorstore, rag_source_desc = build_rag_knowledge_base()
 
     # ================================================================
     # 侧边栏
@@ -1042,13 +1403,23 @@ def main():
         st.divider()
 
         # ---- RAG 状态 ----
-        st.markdown("### 🗄️ RAG Knowledge Base")
+        st.markdown("### 🗄️ RAG 知识库")
         if RAG_AVAILABLE and vectorstore is not None:
-            st.success(f"✅ 知识库就绪\n{len(MEDICAL_KNOWLEDGE_BASE)} 条医学知识")
-        elif not RAG_AVAILABLE:
-            st.warning("⚠️ RAG 未安装\n运行: pip install langchain langchain-community chromadb sentence-transformers")
+            st.success(f"✅ 知识库就绪：{rag_source_desc}")
+            if "PubMed" not in rag_source_desc:
+                st.caption("💡 运行 `python build_knowledge_base.py` 可升级为 PubMed 真实文献库")
+            # 用户可调节检索数量
+            rag_k = st.slider(
+                "检索参考条数 (top-k)",
+                min_value=1, max_value=8, value=3, step=1,
+                help="每次分析后从知识库检索最相关的前 k 条。k越大参考越多，但不相关内容也会增加。"
+            )
         else:
-            st.error("❌ 知识库初始化失败")
+            rag_k = 3   # RAG不可用时给默认值，避免后续引用报错
+            if not RAG_AVAILABLE:
+                st.warning("⚠️ RAG 未安装\n`pip install langchain langchain-community chromadb sentence-transformers`")
+            else:
+                st.error("❌ 知识库初始化失败")
 
         st.divider()
 
@@ -1141,11 +1512,10 @@ def main():
                     report = analyze_with_ollama(img_bytes, model=ollama_model)
                     report["model_used"] = f"Ollama {ollama_model} (Local)"
                 else:
-                    # 从 session_state 读取用户在侧边栏填入的配置
-                    cloud_model = st.session_state.get("cloud_model", "gemini-2.0-flash")
+                    cloud_model = st.session_state.get("cloud_model", "qwen-vl-max")
                     cloud_base_url = st.session_state.get(
                         "cloud_base_url",
-                        "https://generativelanguage.googleapis.com/v1beta/openai"
+                        "https://dashscope.aliyuncs.com/compatible-mode/v1"
                     )
                     report = analyze_with_cloud(
                         img_bytes,
@@ -1154,27 +1524,52 @@ def main():
                         base_url=cloud_base_url
                     )
 
-                # RAG 检索：用主要诊断作为检索词
-                rag_context = []
-                if vectorstore and RAG_AVAILABLE:
-                    primary_dx = report.get("primary_diagnosis", "")
-                    image_type = report.get("image_type", "")
-                    search_query = f"{primary_dx} {image_type}".strip()
-                    if search_query and search_query != "Error":
-                        rag_context = search_medical_knowledge(vectorstore, search_query, k=3)
+            # ── Step 2: RAG 检索（所有模式都做）──
+            rag_context = []
+            if vectorstore and RAG_AVAILABLE and report.get("image_type") != "Error":
+                primary_dx = report.get("primary_diagnosis", "")
+                image_type_str = report.get("image_type", "")
+                search_query = f"{primary_dx} {image_type_str}".strip()
+                if search_query:
+                    rag_context = search_medical_knowledge(vectorstore, search_query, k=rag_k)
 
-                # 保存到 Session State（用于下载按钮）
-                st.session_state.current_report = report
-                st.session_state.current_rag_context = rag_context
+            # ── Step 3: Tool Use Agent（仅云端模式，分析成功时）──
+            tool_use_result = None
+            if (
+                not use_ollama
+                and st.session_state.google_api_key
+                and report.get("image_type") != "Error"
+            ):
+                with st.spinner("🤖 Tool Use Agent 正在调用工具补充临床建议..."):
+                    tool_use_result = analyze_with_tool_use(
+                        diagnosis=report.get("primary_diagnosis", "未知诊断"),
+                        image_type=report.get("image_type", "未知影像"),
+                        api_key=st.session_state.google_api_key,
+                        base_url=st.session_state.get(
+                            "cloud_base_url",
+                            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                        ),
+                        model=st.session_state.get("cloud_model", "qwen-vl-max"),
+                        vectorstore=vectorstore,
+                    )
+                # 把 Tool Use 结果附加到 report，方便 PDF 导出也能包含
+                if tool_use_result:
+                    report["tool_use_summary"] = tool_use_result.get("summary", "")
+                    report["tools_called"] = tool_use_result.get("tools_called", [])
 
-                # 添加到历史记录
-                st.session_state.analysis_history.append({
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "filename": uploaded_file.name,
-                    "diagnosis": report.get("primary_diagnosis", "N/A"),
-                    "severity": report.get("severity", "N/A"),
-                    "model": report.get("model_used", "Unknown")
-                })
+            # 保存到 Session State
+            st.session_state.current_report = report
+            st.session_state.current_rag_context = rag_context
+            st.session_state.current_tool_use = tool_use_result
+
+            # 添加到历史记录
+            st.session_state.analysis_history.append({
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "filename": uploaded_file.name,
+                "diagnosis": report.get("primary_diagnosis", "N/A"),
+                "severity": report.get("severity", "N/A"),
+                "model": report.get("model_used", "Unknown")
+            })
 
         # ---- 显示分析结果 ----
         if st.session_state.current_report:
@@ -1183,7 +1578,8 @@ def main():
 
             render_report_ui(
                 st.session_state.current_report,
-                st.session_state.current_rag_context
+                st.session_state.current_rag_context,
+                st.session_state.current_tool_use
             )
 
             # PDF 下载按钮
