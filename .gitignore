@@ -1,0 +1,67 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+
+# ============================================================
+# .gitignore - 告诉Git哪些文件不要提交到GitHub
+# ============================================================
+
+# ---- 最重要：API Key文件，绝对不能提交！----
+.env
+.env.local
+.env.production
+*.key
+*.env
+
+# ---- Python相关 ----
+__pycache__/          # Python编译缓存
+*.py[cod]             # .pyc .pyo .pyd 编译文件
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ---- 虚拟环境（如果用了venv）----
+venv/
+env/
+.venv/
+
+# ---- 临时文件 ----
+*.tmp
+temp_*.png            # 原始项目的临时图片文件
+
+# ---- 本地向量数据库（体积大，不需要提交）----
+medical_knowledge_db/  # ChromaDB本地数据库文件夹
+
+# ---- HuggingFace模型缓存 ----
+.cache/
+
+# ---- IDE配置文件 ----
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# ---- 操作系统文件 ----
+.DS_Store             # macOS
+Thumbs.db             # Windows
+desktop.ini
+
+# ---- 日志文件 ----
+*.log
+logs/
+
+# ---- 测试图片（如果有真实医学影像，不要上传）----
+test_images/
+sample_data/
+
+# 向量数据库（本地生成的）
+medical_kb/
+chroma_db/
+
+# HuggingFace模型缓存
+.cache/
