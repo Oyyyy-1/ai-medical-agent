@@ -64,5 +64,9 @@ medical_kb_store/
 chroma_db/
 *.chroma
 
+# ---Docker 构建产物---
+.docker/
+
 ai_medical_imaging_backup.py
 ai_medical_imaging.py
+

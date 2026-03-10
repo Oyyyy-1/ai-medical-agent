@@ -40,7 +40,7 @@ from core.rag            import build_rag_knowledge_base, search_medical_knowled
 from core.pdf_report     import generate_pdf_report, PDF_AVAILABLE
 from core.workflow       import run_workflow, LANGGRAPH_AVAILABLE
 from core.cloud_analyzer import analyze_with_cloud_stream
-from core.ollama_analyzer import analyze_with_ollama
+from core.ollama_analyzer import analyze_with_ollama, get_ollama_base_url
 from core.tool_use       import analyze_with_tool_use
 
 
@@ -326,25 +326,51 @@ def main():
         use_ollama = "本地" in model_choice
 
         if use_ollama:
-            st.success("✅ 本地 Ollama，无需 API Key")
+            # ── Ollama 服务检测 ──────────────────────────────────────
+            # 每次侧边栏渲染都重新发请求，不缓存检测结果
+            # 地址从 ollama_analyzer 的环境变量读取：
+            #   直接运行：127.0.0.1:11434
+            #   Docker：  host.docker.internal:11434
+            ollama_base = get_ollama_base_url()
+
+            # 重新检测按钮：点击后 st.rerun() 强制重跑整个脚本
+            # 解决"先开 web 后开 ollama，刷新检测不到"的问题
+            col_detect, col_btn = st.columns([3, 1])
+            with col_detect:
+                st.caption(f"🔗 连接地址：`{ollama_base}`")
+            with col_btn:
+                if st.button("🔄", help="重新检测 Ollama 服务"):
+                    st.rerun()
+
+            ollama_model = None
             try:
-                resp = requests.get("http://127.0.0.1:11434/api/tags", timeout=3)
+                resp = requests.get(f"{ollama_base}/api/tags", timeout=3)
+                resp.raise_for_status()
                 local_models = [m["name"] for m in resp.json().get("models", [])]
-                vision_kw    = ["llava", "moondream", "vision", "phi3"]
+                vision_kw     = ["llava", "moondream", "vision", "phi3"]
                 vision_models = [m for m in local_models
                                  if any(k in m.lower() for k in vision_kw)]
                 sorted_models = vision_models + [m for m in local_models
                                                  if m not in vision_models]
-                st.success(f"✅ 找到 {len(local_models)} 个模型")
-                ollama_model = st.selectbox("选择视觉模型", sorted_models) if sorted_models else None
-                if ollama_model and ollama_model not in vision_models:
-                    st.warning("⚠️ 该模型可能不支持图像输入")
+
+                if sorted_models:
+                    st.success(f"✅ Ollama 运行中，找到 {len(local_models)} 个模型")
+                    ollama_model = st.selectbox("选择视觉模型", sorted_models)
+                    if ollama_model not in vision_models:
+                        st.warning("⚠️ 该模型可能不支持图像输入")
+                else:
+                    st.warning("⚠️ Ollama 运行中但未安装任何模型")
+                    st.code("ollama pull moondream")
+
             except requests.exceptions.ConnectionError:
-                st.error("❌ Ollama 服务未运行\n请执行 `ollama serve`")
-                ollama_model = None
+                st.error(f"❌ 连接不到 Ollama（{ollama_base}）")
+                if "host.docker.internal" in ollama_base:
+                    st.info("Docker 模式：请确保宿主机已运行 `ollama serve`")
+                else:
+                    st.info("请先运行 `ollama serve`，然后点击右上角 🔄 重新检测")
             except Exception as e:
-                st.warning(f"⚠️ 获取模型列表失败：{e}")
-                ollama_model = None
+                st.warning(f"⚠️ 检测失败：{e}")
+                st.button("点击重新检测", on_click=st.rerun)
         else:
             ollama_model = None
             st.markdown("**☁️ 云端 API 配置**")

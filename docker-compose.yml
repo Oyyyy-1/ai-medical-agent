@@ -1,0 +1,34 @@
+# ============================================================
+# docker-compose.yml
+# ============================================================
+# 常用命令：
+#   docker compose up -d       后台启动
+#   docker compose down        停止
+#   docker compose logs -f     查看日志
+#   docker compose up --build  改代码后重新构建
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-medical-agent:latest
+    container_name: ai-medical-agent
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./medical_kb_store:/app/medical_kb_store
+    environment:
+      # 让容器内代码能访问宿主机的 Ollama 服务
+      # host.docker.internal 是 Docker Desktop 提供的特殊域名，指向宿主机
+      # 直接 streamlit run 时不设置此变量，代码默认用 127.0.0.1
+      - OLLAMA_HOST=host.docker.internal
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
