@@ -6,13 +6,19 @@ app.py  —  AI 医学影像智能诊断系统
   core/models.py          Pydantic 数据模型
   core/rag.py             RAG 知识库
   core/ollama_analyzer.py 本地模型调用
-  core/cloud_analyzer.py  云端 API 调用
+  core/cloud_analyzer.py  云端 API 调用（含流式）
   core/tool_use.py        Function Calling Agent
   core/workflow.py        LangGraph 工作流
   core/pdf_report.py      PDF 生成
 
 运行：
   streamlit run app.py
+
+流式输出说明：
+  云端模式下，影像分析阶段使用流式输出（analyze_with_cloud_stream）。
+  用户几乎立刻看到模型开始输出，逐字渲染，感知延迟从10秒降至0.5秒。
+  流结束后自动解析 JSON，进入 RAG + Tool Use 后续流程。
+  本地 Ollama 模式暂不支持流式（moondream 等小模型不稳定）。
 """
 
 import os
@@ -21,7 +27,6 @@ import json
 import requests
 from datetime import datetime
 
-# ---- .env 密钥加载（必须在 streamlit 之前）----
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -31,14 +36,16 @@ except ImportError:
 import streamlit as st
 from PIL import Image as PILImage
 
-# ---- 从 core 包导入所有功能 ----
-from core.rag          import build_rag_knowledge_base, search_medical_knowledge, RAG_AVAILABLE
-from core.pdf_report   import generate_pdf_report, PDF_AVAILABLE
-from core.workflow     import run_workflow, LANGGRAPH_AVAILABLE
+from core.rag            import build_rag_knowledge_base, search_medical_knowledge, RAG_AVAILABLE
+from core.pdf_report     import generate_pdf_report, PDF_AVAILABLE
+from core.workflow       import run_workflow, LANGGRAPH_AVAILABLE
+from core.cloud_analyzer import analyze_with_cloud_stream
+from core.ollama_analyzer import analyze_with_ollama
+from core.tool_use       import analyze_with_tool_use
 
 
 # ============================================================
-# UI 工具函数
+# UI 渲染函数
 # ============================================================
 
 def render_report_ui(report: dict, rag_context: list, tool_use_result: dict = None):
@@ -69,7 +76,6 @@ def render_report_ui(report: dict, rag_context: list, tool_use_result: dict = No
     c4.metric("诊断可信度", conf_cn)
     st.divider()
 
-    # ── 主体两栏 ──
     left, right = st.columns([3, 2])
     with left:
         st.markdown("#### 🔬 主要影像发现")
@@ -103,7 +109,6 @@ def render_report_ui(report: dict, rag_context: list, tool_use_result: dict = No
 
     st.divider()
 
-    # ── 患者说明 ──
     st.markdown("#### 👤 患者友好说明")
     with st.expander("展开查看通俗解读", expanded=True):
         st.markdown(
@@ -113,10 +118,12 @@ def render_report_ui(report: dict, rag_context: list, tool_use_result: dict = No
             unsafe_allow_html=True
         )
 
-    # ── Tool Use Agent 结果 ──
     if tool_use_result and tool_use_result.get("summary"):
         st.markdown("#### 🔧 Tool Use Agent 综合建议")
-        tool_labels = {"search_rag_knowledge": "🗄️ RAG知识库", "search_medical_guidelines": "🌐 网络搜索"}
+        tool_labels = {
+            "search_rag_knowledge": "🗄️ RAG知识库",
+            "search_medical_guidelines": "🌐 网络搜索"
+        }
         tools_called = tool_use_result.get("tools_called", [])
         if tools_called:
             badges = " &nbsp; ".join(
@@ -137,7 +144,6 @@ def render_report_ui(report: dict, rag_context: list, tool_use_result: dict = No
             unsafe_allow_html=True
         )
 
-    # ── RAG 知识库参考 ──
     if rag_context:
         st.markdown("#### 🗄️ RAG 知识库参考")
         with st.expander(f"展开查看 {len(rag_context)} 条匹配医学知识"):
@@ -156,14 +162,118 @@ def render_report_ui(report: dict, rag_context: list, tool_use_result: dict = No
 
 
 # ============================================================
-# 主程序
+# 流式分析核心逻辑（云端模式专用）
+# ============================================================
+
+def run_stream_analysis(img_bytes: bytes, vectorstore, rag_k: int) -> tuple:
+    """
+    云端流式分析完整流程：
+      1. 流式调用模型 → 实时渲染原始文本
+      2. 流结束后拿到解析好的报告字典
+      3. 按严重程度决定是否触发 RAG + Tool Use
+
+    返回：(report, rag_context, tool_use_result, workflow_path)
+
+    为什么不走 LangGraph：
+      LangGraph 的 invoke() 是同步阻塞的，流式 Generator 无法嵌入节点内部
+      直接在 app.py 实现流式分析，LangGraph 保留用于非流式的 Ollama 路径
+    """
+    api_key  = st.session_state.google_api_key or ""
+    base_url = st.session_state.cloud_base_url or ""
+    model    = st.session_state.cloud_model or "qwen-vl-max"
+
+    report = None
+    workflow_path = "流式分析"
+
+    # ── Step 1：流式影像分析 ──
+    st.markdown("#### 🔄 模型实时输出")
+    stream_box = st.empty()   # 占位容器，用于逐字更新文本
+
+    # 用于在 stream_box 里模拟打字效果
+    # Streamlit 没有原生"逐字追加"组件，用 st.empty() + 累积文本替代
+    accumulated = ""
+    with st.spinner(""):     # 空 spinner，视觉上只看到文字流动
+        for chunk in analyze_with_cloud_stream(img_bytes, api_key, model, base_url):
+            if isinstance(chunk, str):
+                # 收到文本片段：累积并刷新显示
+                accumulated += chunk
+                stream_box.markdown(
+                    f"<div style='background:#0e1117;border:1px solid #333;"
+                    f"border-radius:6px;padding:12px;font-family:monospace;"
+                    f"font-size:0.85em;line-height:1.6;max-height:300px;"
+                    f"overflow-y:auto;white-space:pre-wrap;'>{accumulated}▌</div>",
+                    unsafe_allow_html=True
+                )
+            elif isinstance(chunk, dict):
+                # 收到字典：流结束，拿到解析好的报告
+                report = chunk
+
+    # 流结束后用最终文本替换（去掉光标符 ▌）
+    stream_box.markdown(
+        f"<div style='background:#0e1117;border:1px solid #2a2a2a;"
+        f"border-radius:6px;padding:12px;font-family:monospace;"
+        f"font-size:0.85em;line-height:1.6;max-height:300px;"
+        f"overflow-y:auto;white-space:pre-wrap;color:#aaa;'>"
+        f"{accumulated}</div>",
+        unsafe_allow_html=True
+    )
+
+    if report is None or report.get("image_type") == "Error":
+        return report or {}, [], None, "流式分析失败"
+
+    # ── Step 2：按严重程度决定后续路径 ──
+    severity = report.get("severity", "Normal")
+    is_abnormal = severity in ("Mild", "Moderate", "Severe")
+
+    rag_context    = []
+    tool_use_result = None
+
+    if is_abnormal:
+        workflow_path = "流式分析 → 异常路径 → 深度检索"
+        st.info(f"⚠️ 严重程度：{severity}，触发深度检索路径...")
+
+        # RAG 检索
+        if vectorstore and RAG_AVAILABLE:
+            q = f"{report.get('primary_diagnosis','')} {report.get('image_type','')}".strip()
+            if q:
+                rag_context = search_medical_knowledge(vectorstore, q, k=rag_k)
+
+        # Tool Use Agent
+        with st.spinner("🔧 Tool Use Agent 调用工具中..."):
+            tool_use_result = analyze_with_tool_use(
+                diagnosis   = report.get("primary_diagnosis", "未知诊断"),
+                image_type  = report.get("image_type", "未知影像"),
+                api_key     = api_key,
+                base_url    = base_url,
+                model       = model,
+                vectorstore = vectorstore,
+            )
+        if tool_use_result:
+            report["tool_use_summary"] = tool_use_result.get("summary", "")
+            report["tools_called"]     = tool_use_result.get("tools_called", [])
+    else:
+        workflow_path = "流式分析 → 正常路径 → 基础RAG"
+        # 正常路径：只做基础 RAG，不调 Tool Use
+        if vectorstore and RAG_AVAILABLE:
+            q = f"{report.get('primary_diagnosis','')} {report.get('image_type','')}".strip()
+            if q:
+                rag_context = search_medical_knowledge(vectorstore, q, k=rag_k)
+
+    return report, rag_context, tool_use_result, workflow_path
+
+
+# ============================================================
+# RAG 初始化缓存
 # ============================================================
 
 @st.cache_resource
 def _init_rag():
-    """RAG 知识库初始化（缓存，整个会话只执行一次）。"""
     return build_rag_knowledge_base()
 
+
+# ============================================================
+# 主程序
+# ============================================================
 
 def main():
     st.set_page_config(
@@ -177,15 +287,17 @@ def main():
     defaults = {
         "google_api_key": (
             os.getenv("DASHSCOPE_API_KEY") or os.getenv("SILICONFLOW_API_KEY") or
-            os.getenv("GEMINI_API_KEY") or os.getenv("CLOUD_API_KEY")
+            os.getenv("GEMINI_API_KEY")    or os.getenv("CLOUD_API_KEY")
         ),
-        "cloud_model":    os.getenv("CLOUD_MODEL", "qwen-vl-max"),
-        "cloud_base_url": os.getenv("CLOUD_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        "analysis_history":  [],
-        "current_report":    None,
+        "cloud_model":         os.getenv("CLOUD_MODEL", "qwen-vl-max"),
+        "cloud_base_url":      os.getenv("CLOUD_BASE_URL",
+                                         "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        "use_streaming":       True,    # 流式开关，默认开启
+        "analysis_history":    [],
+        "current_report":      None,
         "current_rag_context": [],
-        "current_tool_use":  None,
-        "workflow_path":     "",
+        "current_tool_use":    None,
+        "workflow_path":       "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -218,9 +330,11 @@ def main():
             try:
                 resp = requests.get("http://127.0.0.1:11434/api/tags", timeout=3)
                 local_models = [m["name"] for m in resp.json().get("models", [])]
-                vision_kw = ["llava", "moondream", "vision", "phi3"]
-                vision_models = [m for m in local_models if any(k in m.lower() for k in vision_kw)]
-                sorted_models = vision_models + [m for m in local_models if m not in vision_models]
+                vision_kw    = ["llava", "moondream", "vision", "phi3"]
+                vision_models = [m for m in local_models
+                                 if any(k in m.lower() for k in vision_kw)]
+                sorted_models = vision_models + [m for m in local_models
+                                                 if m not in vision_models]
                 st.success(f"✅ 找到 {len(local_models)} 个模型")
                 ollama_model = st.selectbox("选择视觉模型", sorted_models) if sorted_models else None
                 if ollama_model and ollama_model not in vision_models:
@@ -234,6 +348,7 @@ def main():
         else:
             ollama_model = None
             st.markdown("**☁️ 云端 API 配置**")
+
             PRESETS = {
                 "阿里百炼 DashScope": {
                     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -255,19 +370,28 @@ def main():
                     "model": "gemini-2.0-flash", "key_hint": "AIzaSy...",
                     "note": "需要 VPN | aistudio.google.com，每天免费1500次"
                 },
-                "自定义": {"base_url": "", "model": "", "key_hint": "API Key", "note": "任意 OpenAI 兼容平台"},
+                "自定义": {
+                    "base_url": "", "model": "", "key_hint": "API Key",
+                    "note": "任意 OpenAI 兼容平台"
+                },
             }
             preset = st.selectbox("平台预设", list(PRESETS.keys()), index=0)
             p = PRESETS[preset]
             st.caption(p["note"])
 
-            cloud_base_url = st.text_input("Base URL", value=st.session_state.cloud_base_url
-                                           if preset == "自定义" else p["base_url"])
-            cloud_model    = st.text_input("模型名称", value=st.session_state.cloud_model
-                                           if preset == "自定义" else p["model"])
-            api_key_input  = st.text_input("API Key", type="password",
-                                           value=st.session_state.google_api_key or "",
-                                           placeholder=p["key_hint"])
+            cloud_base_url = st.text_input(
+                "Base URL",
+                value=st.session_state.cloud_base_url if preset == "自定义" else p["base_url"]
+            )
+            cloud_model = st.text_input(
+                "模型名称",
+                value=st.session_state.cloud_model if preset == "自定义" else p["model"]
+            )
+            api_key_input = st.text_input(
+                "API Key", type="password",
+                value=st.session_state.google_api_key or "",
+                placeholder=p["key_hint"]
+            )
 
             st.session_state.google_api_key = api_key_input or st.session_state.google_api_key
             st.session_state.cloud_base_url = cloud_base_url
@@ -278,6 +402,23 @@ def main():
             else:
                 st.warning("⚠️ 请填入 API Key")
 
+            # ── 流式输出开关 ──
+            st.divider()
+            st.markdown("### ⚡ 流式输出")
+            st.session_state.use_streaming = st.toggle(
+                "启用流式输出（Streaming）",
+                value=st.session_state.use_streaming,
+                help=(
+                    "开启后模型逐字输出，几乎立刻看到第一个字（感知延迟 < 1秒）。\n"
+                    "关闭后等待完整响应再显示（等待约10-20秒）。\n"
+                    "仅云端模式有效，本地 Ollama 暂不支持流式。"
+                )
+            )
+            if st.session_state.use_streaming:
+                st.caption("✅ 流式已开启 — 模型输出实时渲染")
+            else:
+                st.caption("⏸ 流式已关闭 — 等待完整响应")
+
         st.divider()
 
         # ── LangGraph 状态 ──
@@ -286,6 +427,8 @@ def main():
             st.success("✅ LangGraph 已就绪\n有向图状态机（4节点+条件边）")
         else:
             st.warning("⚠️ LangGraph 未安装\n`pip install langgraph==0.2.73`")
+        if not use_ollama and st.session_state.use_streaming:
+            st.caption("ℹ️ 流式模式下直接执行，不经过 LangGraph 图")
 
         st.divider()
 
@@ -305,7 +448,9 @@ def main():
             st.markdown("### 📂 历史记录")
             st.caption(f"共 {len(st.session_state.analysis_history)} 条")
             for i, hist in enumerate(reversed(st.session_state.analysis_history[-5:])):
-                with st.expander(f"#{len(st.session_state.analysis_history)-i} {hist['timestamp']}"):
+                with st.expander(
+                    f"#{len(st.session_state.analysis_history)-i} {hist['timestamp']}"
+                ):
                     st.write(f"**诊断**: {hist['diagnosis']}")
                     st.write(f"**严重度**: {hist['severity']}")
             if st.button("🗑️ 清除历史"):
@@ -319,7 +464,12 @@ def main():
     # 主内容区
     # ================================================================
     st.title("🏥 AI 医学影像智能诊断系统")
-    st.markdown("*LangGraph 工作流 · RAG医学知识库 · Function Calling · 结构化报告*")
+
+    # 副标题根据当前模式动态变化
+    if not use_ollama and st.session_state.use_streaming:
+        st.markdown("*⚡ 流式输出 · LangGraph 工作流 · RAG医学知识库 · Function Calling · 结构化报告*")
+    else:
+        st.markdown("*LangGraph 工作流 · RAG医学知识库 · Function Calling · 结构化报告*")
     st.divider()
 
     col_upload, col_info = st.columns([2, 1])
@@ -353,27 +503,51 @@ def main():
 
         # ── 点击分析 ──
         if analyze_btn:
-            with st.spinner("🔄 LangGraph 工作流运行中..." if not use_ollama
-                            else "🔄 本地模型分析中，CPU推理约 1-3 分钟..."):
-                img_io = io.BytesIO()
-                image.convert("RGB").save(img_io, format="PNG")
-                img_bytes = img_io.getvalue()
+            img_io = io.BytesIO()
+            image.convert("RGB").save(img_io, format="PNG")
+            img_bytes = img_io.getvalue()
 
-                report, rag_context, tool_use_result, workflow_path = run_workflow(
-                    image_bytes  = img_bytes,
-                    use_ollama   = use_ollama,
-                    ollama_model = ollama_model or "",
-                    api_key      = st.session_state.google_api_key or "",
-                    base_url     = st.session_state.cloud_base_url or "",
-                    model        = st.session_state.cloud_model or "qwen-vl-max",
-                    vectorstore  = vectorstore,
-                    rag_k        = rag_k,
+            # ── 路径选择 ──────────────────────────────────────────
+            # 云端 + 流式开启 → run_stream_analysis（实时渲染）
+            # 云端 + 流式关闭 → run_workflow（LangGraph，一次性返回）
+            # 本地 Ollama     → run_workflow（LangGraph，CPU推理）
+            # ─────────────────────────────────────────────────────
+            use_stream = not use_ollama and st.session_state.use_streaming
+
+            if use_stream:
+                # 流式路径：直接在主界面实时渲染，不用 spinner 遮挡
+                st.markdown("---")
+                st.markdown("## 📋 影像分析报告")
+                st.caption("⚡ 流式模式 — 模型正在实时生成分析结果...")
+
+                report, rag_context, tool_use_result, workflow_path = run_stream_analysis(
+                    img_bytes, vectorstore, rag_k
                 )
+            else:
+                # 非流式路径：LangGraph 工作流，spinner 等待
+                spinner_msg = (
+                    "🔄 本地模型分析中，CPU推理约 1-3 分钟，请耐心等待..."
+                    if use_ollama else
+                    "🔄 LangGraph 工作流运行中，约 10-20 秒..."
+                )
+                with st.spinner(spinner_msg):
+                    report, rag_context, tool_use_result, workflow_path = run_workflow(
+                        image_bytes  = img_bytes,
+                        use_ollama   = use_ollama,
+                        ollama_model = ollama_model or "",
+                        api_key      = st.session_state.google_api_key or "",
+                        base_url     = st.session_state.cloud_base_url or "",
+                        model        = st.session_state.cloud_model or "qwen-vl-max",
+                        vectorstore  = vectorstore,
+                        rag_k        = rag_k,
+                    )
 
+            # tool_use 结果写入 report
             if tool_use_result:
                 report["tool_use_summary"] = tool_use_result.get("summary", "")
                 report["tools_called"]      = tool_use_result.get("tools_called", [])
 
+            # 保存到 Session State
             st.session_state.current_report       = report
             st.session_state.current_rag_context  = rag_context
             st.session_state.current_tool_use     = tool_use_result
@@ -386,20 +560,24 @@ def main():
                 "model":     report.get("model_used", "Unknown")
             })
 
-        # ── 显示报告 ──
+        # ── 显示结构化报告 ──
         if st.session_state.current_report:
-            st.divider()
-            st.markdown("## 📋 影像分析报告")
+            # 流式模式下标题和路径条已在 run_stream_analysis 前输出，这里补充非流式的头部
+            if not (analyze_btn and not use_ollama and st.session_state.use_streaming):
+                st.divider()
+                st.markdown("## 📋 影像分析报告")
 
+            # 工作流路径条
             wf_path = st.session_state.get("workflow_path", "")
             if wf_path:
-                is_deep = "深度检索" in wf_path
+                is_deep = "深度检索" in wf_path or "异常" in wf_path
+                bg_color = "#1a3a5c" if is_deep else "#1a2f1a"
+                icon     = "🔴" if is_deep else "🟢"
+                label    = "（异常路径：触发深度检索）" if is_deep else "（正常路径：快速生成）"
                 st.markdown(
-                    f"<div style='background:{'#1a3a5c' if is_deep else '#1a2f1a'};"
-                    f"border-radius:6px;padding:6px 14px;margin-bottom:8px;font-size:0.85em;'>"
-                    f"{'🔴' if is_deep else '🟢'} <b>工作流路径：</b>{wf_path}"
-                    f"{'（异常路径：触发深度检索）' if is_deep else '（正常路径：快速生成）'}"
-                    f"</div>",
+                    f"<div style='background:{bg_color};border-radius:6px;"
+                    f"padding:6px 14px;margin-bottom:8px;font-size:0.85em;'>"
+                    f"{icon} <b>执行路径：</b>{wf_path} {label}</div>",
                     unsafe_allow_html=True
                 )
 
@@ -415,7 +593,9 @@ def main():
             with col_dl1:
                 st.download_button(
                     "📥 下载 JSON 报告",
-                    data=json.dumps(st.session_state.current_report, indent=2, ensure_ascii=False),
+                    data=json.dumps(
+                        st.session_state.current_report, indent=2, ensure_ascii=False
+                    ),
                     file_name=f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                     mime="application/json"
                 )
@@ -437,10 +617,10 @@ def main():
         st.markdown("---")
         st.markdown("### 🛠️ 技术架构")
         c1, c2, c3, c4 = st.columns(4)
-        c1.markdown("**🔀 LangGraph**\n有向图工作流\n条件分支路由")
-        c2.markdown("**🗄️ RAG**\nLangChain + ChromaDB\nPubMed文献检索")
-        c3.markdown("**🔧 Tool Use**\nFunction Calling\n模型自主调用工具")
-        c4.markdown("**📄 结构化输出**\nPydantic + PDF\n标准报告导出")
+        c1.markdown("**⚡ 流式输出**\nSSE 逐token渲染\n感知延迟<1秒")
+        c2.markdown("**🔀 LangGraph**\n有向图工作流\n条件分支路由")
+        c3.markdown("**🗄️ RAG**\nLangChain + ChromaDB\nPubMed文献检索")
+        c4.markdown("**🔧 Tool Use**\nFunction Calling\n模型自主调用工具")
 
 
 if __name__ == "__main__":
