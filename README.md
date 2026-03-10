@@ -175,12 +175,10 @@ streamlit run ai_medical_imaging.py
 
 ```
 ai-medical-agent/
-├── ai_medical_imaging.py        # 主程序（Streamlit 应用）
+├── ai_medical_imaging_enhance.py        # 主程序（Streamlit 应用）
 ├── build_knowledge_base.py      # PubMed 文献抓取脚本（一次性运行）
 ├── medical_knowledge_base.json  # RAG 知识库原始数据（PubMed 文献摘要）
 ├── requirements.txt             # Python 依赖
-├── .env                         # API Keys（本地保存，.gitignore 已排除）
-├── .gitignore                   # Git 忽略规则
 ├── assets/
 │   └── demo_screenshot.png      # 演示截图
 └── README.md
