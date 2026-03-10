@@ -1,4 +1,9 @@
-# Web 界面框架
+# ============================================================
+# requirements.txt
+# 安装命令：pip install -r requirements.txt
+# ============================================================
+
+# Web 界面
 streamlit>=1.32.0
 
 # 图像处理
@@ -7,20 +12,25 @@ Pillow>=10.0.0
 # HTTP 请求（调用 Ollama REST API 和云端 API）
 requests>=2.31.0
 
-# 环境变量管理（读取 .env 文件，保护 API Key）
+# 环境变量管理
 python-dotenv>=1.0.0
 
-# Ollama Python 客户端（本地模型，可选）
+# Ollama 客户端（可选）
 ollama>=0.1.9
 
-# LangChain 相关（RAG 知识库）
+# LangChain + RAG
 langchain>=0.2.0
 langchain-community>=0.2.0
 
-# 向量数据库（本地，免费，无需 API Key）
+# LangGraph 工作流状态机
+# 注意：必须固定 0.2.x 版本，与 langchain-core 0.3.x 兼容
+# 最新版 langgraph 1.x 会升级 langchain-core 到 1.x，导致冲突
+langgraph==0.2.73
+
+# 向量数据库
 chromadb>=0.5.0
 
-# HuggingFace 嵌入模型（本地运行，无需 API Key，约 80MB）
+# 嵌入模型（本地运行，约 80MB，无需 API Key）
 sentence-transformers>=3.0.0
 
 # PDF 报告生成
@@ -29,5 +39,5 @@ reportlab>=4.0.0
 # PubMed 文献抓取（运行 build_knowledge_base.py 时需要）
 biopython>=1.83
 
-# 数据处理
+# 数值计算（图像质量预检用到）
 numpy>=1.24.0
