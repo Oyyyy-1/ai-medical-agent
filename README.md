@@ -99,7 +99,7 @@
 ### 项目模块结构
 
 ```
-app.py                    ← Streamlit UI 入口（~280行，纯界面）
+app.py                    ← Streamlit UI 入口
 core/
   ├─ workflow.py           LangGraph 图定义与编排
   ├─ tool_use.py           Function Calling 多轮循环
@@ -224,7 +224,7 @@ ai-medical-agent/
 ├── build_knowledge_base.py       ← PubMed 文献抓取脚本
 ├── medical_knowledge_base.json   ← RAG 知识库原始数据
 ├── requirements.txt
-├── .env                          ← API Keys（已加入 .gitignore）
+├── .env                          ← API Keys（！！！加入 .gitignore防止上传API到GitHub）
 ├── .gitignore
 └── README.md
 ```
@@ -233,7 +233,7 @@ ai-medical-agent/
 
 ---
 
-## 💡 面试技术要点
+## 💡 技术要点
 
 | 技术点 | 在本项目中的体现 |
 |-------|---------------|
