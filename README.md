@@ -241,7 +241,7 @@ ai-medical-agent/
 ├── docker-compose.yml            ← 一键启动配置
 ├── .dockerignore                 ← Docker 构建排除文件
 ├── requirements.txt
-├── .env                          ← API Keys（已加入 .gitignore，不上传）
+├── .env                          ← API Keys（!!!已加入 .gitignore，防止API key上传）
 ├── .gitignore
 └── README.md
 ```
@@ -250,7 +250,7 @@ ai-medical-agent/
 
 ---
 
-## 💡 面试技术要点
+## 💡 技术要点
 
 | 技术点 | 在本项目中的体现 |
 |-------|---------------|
